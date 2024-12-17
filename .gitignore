@@ -36,3 +36,5 @@ install/
 log/
 .old/
 .vscode/
+
+.DS_Store
