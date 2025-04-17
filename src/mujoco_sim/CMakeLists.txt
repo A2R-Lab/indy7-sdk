@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.10)
 project(mujoco_sim)
 
+# Set OpenGL policy to prefer GLVND
+cmake_policy(SET CMP0072 NEW)
+set(OpenGL_GL_PREFERENCE GLVND)
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(indy7_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(mujoco REQUIRED)
 find_package(glfw3 REQUIRED)
 
@@ -23,6 +28,7 @@ target_link_libraries(mujoco_sim_node
 ament_target_dependencies(mujoco_sim_node
   rclcpp
   indy7_msgs
+  sensor_msgs
 )
 
 install(TARGETS mujoco_sim_node
