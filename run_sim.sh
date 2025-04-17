@@ -14,4 +14,4 @@ fi
 
 # Run the simulator
 echo "Running MuJoCo simulator..."
-ros2 run mujoco_sim mujoco_sim_node $(pwd)/src/mujoco_sim/models/indy7.xml 0.01
+ros2 run mujoco_sim mujoco_sim_node $(pwd)/src/mujoco_sim/models/indy7.xml

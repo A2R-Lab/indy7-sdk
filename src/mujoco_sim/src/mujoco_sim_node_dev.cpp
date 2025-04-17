@@ -6,6 +6,7 @@
 #include <GLFW/glfw3.h>
 #include <mujoco/mujoco.h>
 #include <stdexcept>
+#include <cmath>
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "geometry_msgs/msg/wrench.hpp"
@@ -59,7 +60,7 @@ namespace {
 
 class MujocoSimNode : public rclcpp::Node {
 public:
-    MujocoSimNode(std::string model_path) : Node("mujoco_sim_node"), sim_timestep_(0.01) {
+    MujocoSimNode(std::string model_path, float sim_timestep) : Node("mujoco_sim_node"), sim_timestep_(sim_timestep) {
         initializeGLFW();
         initializeMujoco(model_path);
         initializeSimulation();
@@ -83,19 +84,19 @@ private:
     
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr position_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr external_force_sub_;
     rclcpp::TimerBase::SharedPtr sim_timer_;
     
-    double sim_timestep_;
-    double total_sim_time_{0.0};
+    float sim_timestep_;
+    float total_sim_time_{0.0};
     rclcpp::Time current_sim_time_;
     rclcpp::Clock::SharedPtr sim_clock_;
     
     std::vector<std::string> joint_names_{"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
     
-    // // External force parameters
-    // bool apply_external_force_{false};
-    // std::vector<double> external_force_{0.0, 0.0, 0.0};
-    // rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr external_force_sub_;
+    // External force parameters
+    bool apply_external_force_{false};
+    std::vector<double> external_force_{0.0, 0.0, 0.0};
 
     void initializeGLFW() {
         RCLCPP_INFO(get_logger(), "Initializing GLFW");
@@ -122,11 +123,10 @@ private:
         model_->opt.gravity[0], model_->opt.gravity[1], model_->opt.gravity[2] = 0, 0, -9.81;
         data_ = mj_makeData(model_);
 
-        std::vector<double> initial_positions = {0.0, 0.0, 0.0, 0.0, 0.1, 0.1}; // TODO: make a parameter
+        std::vector<double> initial_positions = {0.2, 0.0, 0.0, 0.0, 0.0, 0.0}; // TODO: make a parameter
         for (size_t i = 0; i < initial_positions.size(); ++i) {
             data_->qpos[i] = initial_positions[i];
         }
-
         mj_forward(model_, data_);
     }
 
@@ -141,7 +141,6 @@ private:
         camera_.distance = CameraParams::distance;
         camera_.azimuth = CameraParams::azimuth;
         camera_.elevation = CameraParams::elevation;
-
         model_->opt.timestep = sim_timestep_;
         sim_clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
         current_sim_time_ = sim_clock_->now();
@@ -149,19 +148,19 @@ private:
 
     void initializeROSInterfaces() {
         // joint states publisher
-        state_pub_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+        state_pub_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 1);
 
         // torques from controller
         position_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-            "joint_commands", 10,
+            "joint_commands", 1,
             std::bind(&MujocoSimNode::commandCallback, this, std::placeholders::_1)
         );
         
-        // // External force subscription
-        // external_force_sub_ = create_subscription<geometry_msgs::msg::Wrench>(
-        //     "external_force", 1,
-        //     std::bind(&MujocoSimNode::externalForceCallback, this, std::placeholders::_1)
-        // );
+        // External force subscription
+        external_force_sub_ = create_subscription<geometry_msgs::msg::Wrench>(
+            "external_force", 1,
+            std::bind(&MujocoSimNode::externalForceCallback, this, std::placeholders::_1)
+        );
 
         // simulation steps
         sim_timer_ = create_wall_timer(
@@ -170,7 +169,6 @@ private:
         );
 
         this->set_parameter(rclcpp::Parameter("use_sim_time", true));
-
         RCLCPP_INFO(get_logger(), "MuJoCo simulation node initialized with timestep: %f", sim_timestep_);
     }
 
@@ -185,16 +183,14 @@ private:
 
     void commandCallback(const sensor_msgs::msg::JointState::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(mutex_);
-
         if (msg->position.size() < 6) {
             RCLCPP_WARN(get_logger(), "Received incomplete joint command, expected 6 joint angles");
             return;
         }
         RCLCPP_INFO(get_logger(), "Received effort command: %f %f %f %f %f %f",
-                    msg->effort[0], msg->effort[1], msg->effort[2], 
-                    msg->effort[3], msg->effort[4], msg->effort[5]);
+                    msg->effort[0], msg->effort[1], msg->effort[2], msg->effort[3], msg->effort[4], msg->effort[5]);
         
-        for (size_t i = 0; i < 6; ++i) {
+        for (size_t i = 0; i < 6 && i < msg->effort.size(); ++i) {
             data_->ctrl[i] = msg->effort[i];
         }
     }
@@ -204,33 +200,33 @@ private:
         
         mj_step(model_, data_);
         total_sim_time_ += sim_timestep_;
-        current_sim_time_ = current_sim_time_ + rclcpp::Duration::from_seconds(sim_timestep_);
         publishJointState();
         updateVisualization();
     }
 
-    // void applyExternalForce() {
-    //     // Find the end effector body ID (assuming it's the last body in the model)
-    //     int end_effector_id = model_->nbody - 1;
+    void applyExternalForce() {
+        // Find the end effector body ID (assuming it's the last body in the model)
+        int end_effector_id = model_->nbody - 1;
         
-    //     // Get the end effector position in world frame
-    //     mjtNum pos[3];
-    //     mju_copy3(pos, data_->xpos + 3 * end_effector_id);
+        // Get the end effector position in world frame
+        mjtNum pos[3];
+        mju_copy3(pos, data_->xpos + 3 * end_effector_id);
         
-    //     // Apply force in world frame
-    //     mjtNum force[3] = {external_force_[0], external_force_[1], external_force_[2]};
-    //     mjtNum torque[3] = {0, 0, 0}; // No torque applied
+        // Apply force in world frame
+        mjtNum force[3] = {external_force_[0], external_force_[1], external_force_[2]};
+        mjtNum torque[3] = {0, 0, 0}; // No torque applied
         
-    //     // Apply the force and torque to the end effector
-    //     mj_applyFT(model_, data_, force, torque, pos, end_effector_id, data_->qfrc_applied);
-    // }
+        // Apply the force and torque to the end effector
+        mj_applyFT(model_, data_, force, torque, pos, end_effector_id, data_->qfrc_applied);
+    }
 
     void publishJointState() {
         auto state_msg = std::make_unique<sensor_msgs::msg::JointState>();
+        current_sim_time_ = current_sim_time_ + rclcpp::Duration::from_seconds(sim_timestep_);
         state_msg->header.stamp = current_sim_time_;
         state_msg->name = joint_names_;
 
-        // TODO: is this needed?
+        // TODO: needed?
         state_msg->position.resize(model_->nv);
         state_msg->velocity.resize(model_->nv);
         state_msg->effort.resize(model_->nv);
@@ -238,18 +234,21 @@ private:
         for (int i = 0; i < model_->nv; ++i) {
             state_msg->position[i] = data_->qpos[i];
             state_msg->velocity[i] = data_->qvel[i];
-            state_msg->effort[i] = data_->qfrc_applied[i];
+            //state_msg->effort[i] = data_->qfrc_applied[i];
         }
 
-        for (int i = 0; i < 3; ++i) {
-            state_msg->effort[i] = data_->xpos[i];
-        }
-
-        RCLCPP_INFO(get_logger(), "Publishing joint state, positions: %f %f %f %f %f %f",
-                    state_msg->position[0], state_msg->position[1], state_msg->position[2], 
-                    state_msg->position[3], state_msg->position[4], state_msg->position[5]);
+        // get end effector position
+        int end_effector_id = model_->nbody - 1;
+        mjtNum pos[3];
+        mju_copy3(pos, data_->xpos + 3 * end_effector_id);
+        state_msg->effort[0] = pos[0];
+        state_msg->effort[1] = pos[1];
+        state_msg->effort[2] = pos[2];
 
         state_pub_->publish(std::move(state_msg));
+        RCLCPP_INFO(get_logger(), "published joint state. Positions: %f, %f, %f, %f, %f, %f", 
+                    state_msg->position[0], state_msg->position[1], state_msg->position[2], 
+                    state_msg->position[3], state_msg->position[4], state_msg->position[5]);
     }
 
     void updateVisualization() {
@@ -268,23 +267,23 @@ private:
         glfwPollEvents();
     }
 
-    // void externalForceCallback(const geometry_msgs::msg::Wrench::SharedPtr msg) {
-    //     std::lock_guard<std::mutex> lock(mutex_);
-    //     external_force_[0] = msg->force.x;
-    //     external_force_[1] = msg->force.y;
-    //     external_force_[2] = msg->force.z;
-    //     apply_external_force_ = true;
+    void externalForceCallback(const geometry_msgs::msg::Wrench::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        external_force_[0] = msg->force.x;
+        external_force_[1] = msg->force.y;
+        external_force_[2] = msg->force.z;
+        apply_external_force_ = true;
         
-    //     RCLCPP_INFO(get_logger(), "Received external force: [%f, %f, %f]",
-    //                 external_force_[0], external_force_[1], external_force_[2]);
+        RCLCPP_INFO(get_logger(), "Received external force: [%f, %f, %f]",
+                    external_force_[0], external_force_[1], external_force_[2]);
 
-    //     applyExternalForce();
-    // }
+        applyExternalForce();
+    }
 };
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<MujocoSimNode>(argv[1]);
+    auto node = std::make_shared<MujocoSimNode>(argv[1], std::stod(argv[2]));
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
