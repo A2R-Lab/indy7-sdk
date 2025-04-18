@@ -109,7 +109,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         
         // Reset to initial positions
-        std::vector<double> initial_positions = {0.2, 0.0, 0.0, 0.0, 0.0, 0.0};
+        std::vector<double> initial_positions = {1.57994932,  0.06313131, -1.18071498,  1.09272369, -0.6255293,  -0.01895007};
         for (size_t i = 0; i < initial_positions.size() && i < model_->nv; ++i) {
             data_->qpos[i] = initial_positions[i];
             data_->qvel[i] = 0.0;
@@ -193,7 +193,7 @@ private:
         // model_->opt.gravity[0], model_->opt.gravity[1], model_->opt.gravity[2] = 0, 0, 0;
         data_ = mj_makeData(model_);
 
-        std::vector<double> initial_positions = {0.2, 0.0, 0.0, 0.0, 0.0, 0.0}; // TODO: make a parameter
+        std::vector<double> initial_positions = {1.57994932,  0.06313131, -1.18071498,  1.09272369, -0.6255293,  -0.01895007}; // TODO: make a parameter
         for (size_t i = 0; i < initial_positions.size(); ++i) {
             data_->qpos[i] = initial_positions[i];
         }
@@ -380,7 +380,7 @@ private:
         RCLCPP_INFO(rclcpp::get_logger("mujoco_sim_node"), "Received external force: [%f, %f, %f]",
                     external_force_[0], external_force_[1], external_force_[2]);
 
-        //applyExternalForce();
+        applyExternalForce();
     }
 };
 
