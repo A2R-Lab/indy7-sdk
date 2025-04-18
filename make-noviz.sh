@@ -3,7 +3,7 @@
 source /opt/ros/humble/setup.bash
 
 # only build mujoco_sim 
-colcon build --symlink-install --packages-select mujoco_sim  --cmake-args -DENABLE_VISUALIZATION=OFF
+colcon build --symlink-install --packages-select mujoco_sim --cmake-args -DENABLE_VISUALIZATION=OFF
 
 source install/setup.bash
 
