@@ -6,8 +6,9 @@ if ! docker image inspect indy7-env &>/dev/null; then
     docker build -t indy7-env .
 fi
 
+#export DISPLAY="127.0.0.1:10.0"
+xhost + #+local:root
 # Allow X11 connections from any host
-xhost +local:root
 
 # Run the Docker container with X11 forwarding
 docker run -it \

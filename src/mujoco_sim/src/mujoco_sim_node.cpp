@@ -3,12 +3,15 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <GLFW/glfw3.h>
 #include <mujoco/mujoco.h>
 #include <stdexcept>
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "geometry_msgs/msg/wrench.hpp"
+#include <GLFW/glfw3.h>
+
+// Forward declaration of MujocoSimNode class
+class MujocoSimNode;
 
 namespace {
     struct CameraParams {
@@ -24,6 +27,10 @@ namespace {
         static inline double last_y = 0.0;
     };
 
+    // Flag to indicate that a reset is requested
+    static inline bool reset_requested = false;
+
+#ifdef ENABLE_VISUALIZATION
     void glfw_error_callback(int error, const char* description) {
         std::cerr << "GLFW Error " << error << ": " << description << std::endl;
     }
@@ -31,6 +38,11 @@ namespace {
     void keyboard_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
         if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
+        }
+        
+        // Set reset flag when 'R' key is pressed
+        if (key == GLFW_KEY_R && action == GLFW_PRESS) {
+            reset_requested = true;
         }
     }
 
@@ -55,19 +67,66 @@ namespace {
     void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
         CameraParams::distance *= 1.0f - yoffset * 0.1f;
     }
+
+#else
+    void initializeGLFW() {
+        return;
+        //RCLCPP_INFO(get_logger(), "Visualization disabled");
+    }   
+#endif
 }
+
+// Global pointer to the MujocoSimNode instance
+MujocoSimNode* g_mujoco_sim_node = nullptr;
 
 class MujocoSimNode : public rclcpp::Node {
 public:
-    MujocoSimNode(std::string model_path, double sim_timestep) : Node("mujoco_sim_node"), sim_timestep_(sim_timestep) {
-        initializeGLFW();
+    MujocoSimNode(std::string model_path, double sim_timestep, bool enable_visualization) 
+        : Node("mujoco_sim_node"), 
+          sim_timestep_(sim_timestep),
+          enable_visualization_(enable_visualization) {
+        
+        // Set the global pointer to this instance
+        g_mujoco_sim_node = this;
+        
+        if (enable_visualization_) {
+            initializeGLFW();
+        }
+        
         initializeMujoco(model_path);
         initializeSimulation();
         initializeROSInterfaces();
     }
 
     ~MujocoSimNode() {
+        // Clear the global pointer
+        g_mujoco_sim_node = nullptr;
         cleanup();
+    }
+
+    // Add a public method to reset the robot state
+    void resetRobotState() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // Reset to initial positions
+        std::vector<double> initial_positions = {0.2, 0.0, 0.0, 0.0, 0.0, 0.0};
+        for (size_t i = 0; i < initial_positions.size() && i < model_->nv; ++i) {
+            data_->qpos[i] = initial_positions[i];
+            data_->qvel[i] = 0.0;
+        }
+        
+        // Reset controls
+        for (int i = 0; i < model_->nu; ++i) {
+            data_->ctrl[i] = 0.0;
+        }
+        
+        // Reset command received flag to wait for a new command
+        command_received_ = false;
+        
+        // Forward the model to update the state
+        mj_forward(model_, data_);
+        
+        RCLCPP_INFO(get_logger(), "Robot state reset to initial position. Waiting for new command.");
     }
 
 private:
@@ -79,7 +138,10 @@ private:
     mjvCamera camera_;
     mjvOption options_;
     mjrContext context_;
+    
+#ifdef ENABLE_VISUALIZATION
     GLFWwindow* window_{nullptr};
+#endif
     
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr position_sub_;
@@ -96,7 +158,14 @@ private:
     bool apply_external_force_{false};
     std::vector<double> external_force_{0.0, 0.0, 0.0};
     rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr external_force_sub_;
+    
+    // Visualization flag
+    bool enable_visualization_;
+    
+    // Flag to track if a command has been received
+    bool command_received_{false};
 
+#ifdef ENABLE_VISUALIZATION
     void initializeGLFW() {
         RCLCPP_INFO(get_logger(), "Initializing GLFW");
         if (!glfwInit()) { throw std::runtime_error("Failed to initialize GLFW"); }
@@ -110,6 +179,7 @@ private:
         glfwSetKeyCallback(window_, keyboard_callback);
         glfwSetScrollCallback(window_, scroll_callback);
     }
+#endif
 
     void initializeMujoco(std::string model_path) {
         RCLCPP_INFO(get_logger(), "loading MuJoCo model from %s", model_path.c_str());
@@ -135,12 +205,16 @@ private:
         mjv_defaultCamera(&camera_);
         mjv_defaultOption(&options_);
         mjr_defaultContext(&context_);
-        mjv_makeScene(model_, &scene_, 2000);
-        mjr_makeContext(model_, &context_, mjFONTSCALE_150);
-        camera_.type = mjCAMERA_FREE;
-        camera_.distance = CameraParams::distance;
-        camera_.azimuth = CameraParams::azimuth;
-        camera_.elevation = CameraParams::elevation;
+        
+        if (enable_visualization_) {
+            mjv_makeScene(model_, &scene_, 2000);
+            mjr_makeContext(model_, &context_, mjFONTSCALE_150);
+            camera_.type = mjCAMERA_FREE;
+            camera_.distance = CameraParams::distance;
+            camera_.azimuth = CameraParams::azimuth;
+            camera_.elevation = CameraParams::elevation;
+        }
+        
         model_->opt.timestep = sim_timestep_;
         sim_clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
         current_sim_time_ = sim_clock_->now();
@@ -170,38 +244,66 @@ private:
 
         this->set_parameter(rclcpp::Parameter("use_sim_time", true));
         RCLCPP_INFO(get_logger(), "MuJoCo simulation node initialized with timestep: %f", sim_timestep_);
+
     }
 
     void cleanup() {
         if (data_) mj_deleteData(data_);
         if (model_) mj_deleteModel(model_);
-        mjv_freeScene(&scene_);
-        mjr_freeContext(&context_);
-        if (window_) glfwDestroyWindow(window_);
-        glfwTerminate();
+        
+        if (enable_visualization_) {
+            mjv_freeScene(&scene_);
+            mjr_freeContext(&context_);
+#ifdef ENABLE_VISUALIZATION
+            if (window_) glfwDestroyWindow(window_);
+            glfwTerminate();
+#endif
+        }
     }
 
     void commandCallback(const sensor_msgs::msg::JointState::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(mutex_);
+
         if (msg->position.size() < 6) {
             RCLCPP_WARN(get_logger(), "Received incomplete joint command, expected 6 joint angles");
             return;
         }
-        RCLCPP_INFO(get_logger(), "Received effort command: %f %f %f %f %f %f",
-                    msg->effort[0], msg->effort[1], msg->effort[2], msg->effort[3], msg->effort[4], msg->effort[5]);
-        
+
         for (size_t i = 0; i < 6 && i < msg->effort.size(); ++i) {
             data_->ctrl[i] = msg->effort[i];
         }
+
+        // RCLCPP_INFO(get_logger(), "Received controls: %.4f %.4f %.4f %.4f %.4f %.4f",
+        //             msg->effort[0], msg->effort[1], msg->effort[2], msg->effort[3], msg->effort[4], msg->effort[5]);
+        // ---
+        // Set the command received flag
+        command_received_ = true;
     }
+    
 
     void simulationStep() {
         std::lock_guard<std::mutex> lock(mutex_);
         
-        mj_step(model_, data_);
+        // Check if reset was requested
+        if (reset_requested) {
+            resetRobotState();
+            reset_requested = false;
+        }
+        
+        // Only step the simulation if a command has been received
+        if (command_received_) {
+            mj_step(model_, data_);
+        } else {
+            // If no command received yet, just forward the model to update visualization
+            mj_forward(model_, data_);
+        }
+        
         total_sim_time_ += sim_timestep_;
         publishJointState();
-        updateVisualization();
+        
+        if (enable_visualization_) {
+            updateVisualization();
+        }
     }
 
     void applyExternalForce() {
@@ -218,6 +320,8 @@ private:
         
         // Apply the force and torque to the end effector
         mj_applyFT(model_, data_, force, torque, pos, end_effector_id, data_->qfrc_applied);
+
+        RCLCPP_INFO(rclcpp::get_logger("mujoco_sim_node"), "applied force: %.4f %.4f %.4f on end effector", force[0], force[1], force[2]);
     }
 
     void publishJointState() {
@@ -236,10 +340,14 @@ private:
             state_msg->velocity[i] = data_->qvel[i];
             state_msg->effort[i] = data_->qfrc_applied[i];
         }
-
+        for (int i = 0; i < 3; ++i) {
+            state_msg->effort[i] = data_->xpos[3 * (model_->nbody - 1) + i];
+        }
+        
         state_pub_->publish(std::move(state_msg));
     }
 
+#ifdef ENABLE_VISUALIZATION
     void updateVisualization() {
         camera_.azimuth = CameraParams::azimuth;
         camera_.elevation = CameraParams::elevation;
@@ -255,6 +363,12 @@ private:
         glfwSwapBuffers(window_);
         glfwPollEvents();
     }
+#else
+    void updateVisualization() {
+        //RCLCPP_INFO(get_logger(), "Visualization disabled");
+        return;
+    }
+#endif
 
     void externalForceCallback(const geometry_msgs::msg::Wrench::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -263,16 +377,38 @@ private:
         external_force_[2] = msg->force.z;
         apply_external_force_ = true;
         
-        RCLCPP_INFO(get_logger(), "Received external force: [%f, %f, %f]",
+        RCLCPP_INFO(rclcpp::get_logger("mujoco_sim_node"), "Received external force: [%f, %f, %f]",
                     external_force_[0], external_force_[1], external_force_[2]);
 
-        applyExternalForce();
+        //applyExternalForce();
     }
 };
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<MujocoSimNode>(argv[1], std::stod(argv[2]));
+    
+    // Parse command line arguments
+    if (argc < 3) {
+        RCLCPP_ERROR(rclcpp::get_logger("mujoco_sim_node"), 
+                     "Usage: %s <model_path> <sim_timestep> [enable_visualization]", argv[0]);
+        return 1;
+    }
+    
+    std::string model_path = argv[1];
+    double sim_timestep = std::stod(argv[2]);
+    bool enable_visualization = true; // Default to visualization enabled
+    
+    // Check if visualization flag is provided
+    if (argc > 3) {
+        std::string vis_flag = argv[3];
+        enable_visualization = (vis_flag == "true" || vis_flag == "1");
+    }
+    
+    RCLCPP_INFO(rclcpp::get_logger("mujoco_sim_node"), 
+                "Starting MuJoCo simulation with visualization: %s", 
+                enable_visualization ? "enabled" : "disabled");
+    
+    auto node = std::make_shared<MujocoSimNode>(model_path, sim_timestep, enable_visualization);
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

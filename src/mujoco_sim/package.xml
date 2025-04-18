@@ -13,6 +13,10 @@
   <depend>indy7_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>mujoco</depend>
+  
+  <!-- GLFW is an optional dependency for visualization -->
+  <build_depend condition="$ENABLE_VISUALIZATION == 'ON'">glfw3</build_depend>
+  <exec_depend condition="$ENABLE_VISUALIZATION == 'ON'">glfw3</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
